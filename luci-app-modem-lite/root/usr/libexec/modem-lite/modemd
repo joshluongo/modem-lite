@@ -1,0 +1,30 @@
+#!/usr/bin/ucode
+// modem-lite daemon (started by /etc/init.d/modem-lite): keeps the data call
+// up, applies the APN/PIN, drives the signal LEDs, caches status for LuCI and
+// forwards new SMS to Slack. See /usr/share/ucode/modemlite.uc.
+
+'use strict';
+
+let ml = require('modemlite');
+
+ml.set_verbose(true);
+
+while (true) {
+	let cfg = ml.config();
+
+	try {
+		ml.cycle(cfg);
+	}
+	catch (e) {
+		warn(`modem-lite: ${e}\n`);
+	}
+
+	try {
+		ml.forward_new(cfg);
+	}
+	catch (e) {
+		warn(`modem-lite: ${e}\n`);
+	}
+
+	system(['sleep', '' + ml.interval(cfg)]);
+}

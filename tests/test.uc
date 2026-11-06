@@ -28,7 +28,7 @@ function sh(cmd) {
 }
 
 function reset(link) {
-	sh(`rm -rf ${FAKE}/inbox ${FAKE}/active ${FAKE}/sent ${FAKE}/posts ${FAKE}/at.log /tmp/ml-run /tmp/ml-forwarded; mkdir -p ${FAKE}/inbox; touch ${FAKE}/active`);
+	sh(`rm -rf ${FAKE}/inbox ${FAKE}/pdu ${FAKE}/active ${FAKE}/sent ${FAKE}/posts ${FAKE}/at.log /tmp/ml-run /tmp/ml-forwarded; mkdir -p ${FAKE}/inbox ${FAKE}/pdu; touch ${FAKE}/active`);
 	fs.writefile(FAKE + '/link', link ?? '0 0');
 	fs.writefile(FAKE + '/apn', 'telstra.internet');
 	fs.writefile(FAKE + '/pdp', 'IPV4V6');
@@ -162,6 +162,28 @@ add_sms(2, '"sender":"Telstra","timestamp":"2026-11-06 02:00:00","reference":5,"
 let l = ml.sms_list(cfg());
 eq('sms list', map(l.messages, m => [m.indexes, m.sender, m.text]),
 	[[[1, 2], 'Telstra', 'Part one, part two'], [[0], '61412345678', 'Hello é']]);
+
+// SMS-DELIVER as received on the MB118-4G (sender replaced): SCTS
+// 26-11-06 15:20:35, zone octet 0x04 = +40 quarter hours (+10:00).
+const PDU_AEST = '07911614786072F5040B911604000000F00000621160510253040' + '4D4F29C0E';
+
+eq('pdu tz +10:00', ml.pdu_tz(PDU_AEST), 600);
+eq('pdu tz -05:00', ml.pdu_tz(replace(PDU_AEST, '62116051025304', '6211605102530A')), -300);
+eq('pdu tz alphanumeric sender', ml.pdu_tz('07911614786072F5040ED0D4F29C0E9A36A70000621160510253040' + '4D4F29C0E'), 600);
+eq('pdu tz not deliver', ml.pdu_tz('0001000B911604000000F0000004D4F29C0E'), null);
+eq('pdu tz truncated', ml.pdu_tz('07911614786072F5040B91'), null);
+eq('to_utc', ml.to_utc('2026-11-06 15:20:35', 600), '2026-11-06 05:20:35');
+eq('to_utc west', ml.to_utc('2026-11-06 15:20:35', -300), '2026-11-06 20:20:35');
+eq('to_utc day rollover', ml.to_utc('2026-01-01 05:00:00', 600), '2025-12-31 19:00:00');
+eq('to_utc unknown zone', ml.to_utc('2026-11-06 15:20:35', null), '2026-11-06 15:20:35');
+
+add_sms(5, '"sender":"61400000000","timestamp":"2026-11-06 15:20:35","content":"Test"');
+fs.writefile(FAKE + '/pdu/5', PDU_AEST);
+eq('sms list reports UTC', map(filter(ml.sms_list(cfg()).messages, m => m.indexes[0] == 5), m => m.timestamp),
+	['2026-11-06 05:20:35']);
+eq('sms list keeps time without a zone', map(filter(ml.sms_list(cfg()).messages, m => m.indexes[0] == 0), m => m.timestamp),
+	['2026-11-06 01:00:00']);
+sh(`rm ${FAKE}/inbox/5 ${FAKE}/pdu/5`);
 
 eq('send ok', ml.sms_send(cfg(), '+61 412 345 678', 'Hi [there]'), { ok: true });
 eq('send recorded without +', trim(fs.readfile(FAKE + '/sent')), '61412345678\tHi [there]');

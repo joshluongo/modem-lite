@@ -87,7 +87,9 @@ Limits that come from `sms-tool`:
 - Sent messages are a single GSM 7-bit SMS: plain ASCII, up to 160
   characters. The characters `^{}\[~]|` count twice.
 - Numbers must be in international format.
-- Received timestamps are in UTC. LuCI shows them in the browser's time zone.
+- `sms-tool` prints the SMS centre's local time without its zone. The
+  package reads the zone from each raw PDU and converts it to UTC; LuCI shows
+  the result in the browser's time zone.
 
 When Slack forwarding is first enabled, the messages already on the modem
 are recorded as seen and are not posted. Forwarding state is kept in

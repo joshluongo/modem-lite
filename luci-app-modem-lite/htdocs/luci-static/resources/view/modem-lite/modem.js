@@ -13,15 +13,15 @@ const callRestart = rpc.declare({ object: 'modem-lite', method: 'restart' });
 const QUALITY = [ _('No signal'), _('Poor'), _('Fair'), _('Good'), _('Excellent') ];
 const BAR_COLORS = [ '#9e9e9e', '#d9534f', '#e8a33d', '#5cb85c', '#2e8b57' ];
 
+// dBm needed for 1, 2, 3 and 4 bars.
+const RSRP_BARS = [ -115, -105, -95, -85 ];
+const RSSI_BARS = [ -103, -93, -83, -73 ];
+
 // 0-4 bars from RSRP (LTE), falling back to RSSI from AT+CSQ.
 function signalBars(st) {
-	if (st.rsrp != null)
-		return st.rsrp >= -85 ? 4 : st.rsrp >= -95 ? 3 : st.rsrp >= -105 ? 2 : st.rsrp >= -115 ? 1 : 0;
+	const [ value, steps ] = (st.rsrp != null) ? [ st.rsrp, RSRP_BARS ] : [ st.rssi, RSSI_BARS ];
 
-	if (st.rssi != null)
-		return st.rssi >= -73 ? 4 : st.rssi >= -83 ? 3 : st.rssi >= -93 ? 2 : st.rssi >= -103 ? 1 : 0;
-
-	return 0;
+	return (value == null) ? 0 : steps.filter(min => value >= min).length;
 }
 
 function signalMeter(st) {

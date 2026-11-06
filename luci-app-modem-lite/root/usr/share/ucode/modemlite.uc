@@ -582,6 +582,64 @@ function utc_epoch(ts) {
 	return days * 86400 + (+m[4]) * 3600 + (+m[5]) * 60 + (+m[6]);
 }
 
+// Time zone in minutes east of UTC from the TP-SCTS of an SMS-DELIVER PDU
+// (hex, with SMSC prefix), or null. The zone octet holds quarter hours as
+// swapped BCD; bit 3 is the sign.
+function pdu_tz(pdu) {
+	let byte = (i) => {
+		let s = substr(pdu, i * 2, 2);
+
+		return (length(s) == 2) ? hex(s) : null;
+	};
+	let i = byte(0) + 1;			// skip SMSC address
+
+	if (byte(i) == null || (byte(i) & 0x03) != 0)	// not SMS-DELIVER
+		return null;
+
+	let digits = byte(i + 1);
+
+	i += 3 + int((digits + 1) / 2) + 2;	// first octet, OA length/type/digits, PID, DCS
+
+	let tz = byte(i + 6);
+
+	if (type(tz) != 'int' || length(pdu) < (i + 7) * 2)
+		return null;
+
+	let quarters = (tz & 0x07) * 10 + (tz >> 4);
+
+	return ((tz & 0x08) ? -quarters : quarters) * 15;
+}
+
+// { index: tz minutes } from "sms_tool -r recv" ("MSG: <n>" then the PDU).
+function pdu_zones(out) {
+	let zones = {}, idx = null;
+
+	for (let l in split(out ?? '', '\n')) {
+		let m = match(trim(l), /^MSG: ([0-9]+)$/);
+
+		if (m)
+			idx = m[1];
+		else if (idx != null && match(trim(l), /^[0-9A-Fa-f]+$/)) {
+			zones[idx] = pdu_tz(trim(l));
+			idx = null;
+		}
+	}
+
+	return zones;
+}
+
+// SMSC local "YYYY-MM-DD HH:MM:SS" plus zone (minutes) -> same format in UTC.
+function to_utc(ts, tz_minutes) {
+	let t = utc_epoch(ts);
+
+	if (t == null || tz_minutes == null)
+		return ts;
+
+	let g = gmtime(t - tz_minutes * 60);
+
+	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', g.year, g.mon, g.mday, g.hour, g.min, g.sec);
+}
+
 // Join the parts of multipart messages: [{ indexes, sender, timestamp, text,
 // parts, total, complete }], newest first.
 function merge_parts(raw) {
@@ -649,6 +707,15 @@ function sms_list(cfg) {
 
 	if (r.code != 0 || type(d?.msg) != 'array')
 		return { error: 'Could not read messages from the modem' };
+
+	// sms_tool prints the SMSC's local time without its zone; take the zone
+	// from each raw PDU and report UTC.
+	let raw = run(sprintf('flock %s sms_tool -d %s -r recv 2>/dev/null',
+		q(lock_for(port)), q(port)));
+	let zones = pdu_zones(raw.out);
+
+	for (let m in d.msg)
+		m.timestamp = to_utc(m.timestamp, zones[m.index]);
 
 	return { messages: merge_parts(d.msg) };
 }
@@ -864,5 +931,6 @@ return {
 	sms_list, sms_send, sms_delete, sms_forward, slack_test, forward_new,
 	// exported for tests
 	parse_cgdcont, data_cid, parse_link, parse_signal, signal_level,
-	parse_cops, parse_reg, merge_parts, utc_epoch, slack_format, msg_key
+	parse_cops, parse_reg, merge_parts, utc_epoch, slack_format, msg_key,
+	pdu_tz, to_utc
 };

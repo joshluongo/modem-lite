@@ -1,14 +1,15 @@
 #!/bin/sh
 # Fake sms_tool emulating the EC200A replies recorded in the MB118-4G notes.
-# State lives in $FAKE: link ("<cid> <state>"), active (cids), apn, inbox/<n>,
-# sent, at.log.
+# State lives in $FAKE: link ("<cid> <state>"), active (cids), apn, inbox/<n>
+# (JSON fields), pdu/<n> (raw PDU for "-r recv"), sent, at.log.
 
-dev= json= cmd=
+dev= json= raw= cmd=
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-d) dev=$2; shift 2 ;;
 	-f|-s|-b|-c) shift 2 ;;
 	-j) json=1; shift ;;
+	-r) raw=1; shift ;;
 	-*) shift ;;
 	*) cmd=$1; shift; break ;;
 	esac
@@ -59,6 +60,14 @@ at)
 	exit 0
 	;;
 recv)
+	if [ -n "$raw" ] && [ -z "$json" ]; then
+		for f in $(ls "$FAKE/inbox" 2>/dev/null | sort -n); do
+			echo "MSG: $f"
+			cat "$FAKE/pdu/$f" 2>/dev/null || echo 00
+			echo
+		done
+		exit 0
+	fi
 	printf '{"msg":['
 	sep=
 	for f in $(ls "$FAKE/inbox" 2>/dev/null | sort -n); do

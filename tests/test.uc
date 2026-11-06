@@ -1,0 +1,367 @@
+// Tests for modemlite.uc. Run by tests/run.sh inside an OpenWrt rootfs
+// container (needs ucode, uci, flock and the fakes in tests/fake on PATH).
+
+'use strict';
+
+let fs = require('fs');
+let ml = require('modemlite');
+let FAKE = getenv('FAKE');
+let failures = 0, count = 0;
+
+function eq(name, got, want) {
+	count++;
+	if (sprintf('%J', got) != sprintf('%J', want)) {
+		failures++;
+		warn(sprintf('FAIL %s\n  got:  %J\n  want: %J\n', name, got, want));
+	}
+}
+
+function ok(name, cond) {
+	eq(name, !!cond, true);
+}
+
+function sh(cmd) {
+	let p = fs.popen(cmd, 'r');
+	let out = p.read('all');
+	p.close();
+	return out;
+}
+
+function reset(link) {
+	sh(`rm -rf ${FAKE}/inbox ${FAKE}/pdu ${FAKE}/active ${FAKE}/sent ${FAKE}/posts ${FAKE}/at.log /tmp/ml-run /tmp/ml-forwarded; mkdir -p ${FAKE}/inbox ${FAKE}/pdu; touch ${FAKE}/active`);
+	fs.writefile(FAKE + '/link', link ?? '0 0');
+	fs.writefile(FAKE + '/apn', 'telstra.internet');
+	fs.writefile(FAKE + '/pdp', 'IPV4V6');
+	fs.writefile(FAKE + '/cpin', '+CPIN: READY');
+}
+
+function at_log() {
+	return filter(split(fs.readfile(FAKE + '/at.log') ?? '', '\n'), l => l != '');
+}
+
+function cfg(modem, slack, wan) {
+	return {
+		modem: { autoconnect: '1', signal_led: ['green:signal1', 'green:signal2', 'green:signal3'], ...(modem ?? {}) },
+		slack: slack ?? {},
+		wan: wan ?? { proto: 'dhcp', device: 'usb0' }
+	};
+}
+
+function add_sms(i, body) {
+	fs.writefile(`${FAKE}/inbox/${i}`, body);
+}
+
+/* ---- Parsers (replies captured from the EC200A) -------------------------- */
+
+eq('cgdcont', ml.parse_cgdcont(['+CGDCONT: 2,"IPV4V6","telstra.internet","0.0.0.0",0,0', '+CGDCONT: 8,"IPV4V6","ims","0.0.0.0",0,0']),
+	[{ cid: 2, pdp: 'IPV4V6', apn: 'telstra.internet' }, { cid: 8, pdp: 'IPV4V6', apn: 'ims' }]);
+eq('data cid skips IMS/empty', ml.data_cid([{ cid: 1, apn: '' }, { cid: 8, apn: 'IMS' }, { cid: 2, apn: 'x' }]), 2);
+eq('data cid none', ml.data_cid([{ cid: 8, apn: 'ims' }]), null);
+eq('link up', ml.parse_link(['+QNETDEVCTL: 1,2,1,1']), { cid: 2, up: true });
+eq('link down', ml.parse_link(['+QNETDEVCTL: 0,0,0,0']), { cid: 0, up: false });
+eq('signal', ml.parse_signal(['+CESQ: 51,99,255,255,20,50', '+CSQ: 27,99']), { rsrp: -91, rsrq: -10.0, csq: 27, rssi: -59 });
+eq('signal unknown', ml.parse_signal(['+CESQ: 99,99,255,255,255,255', '+CSQ: 99,99']), {});
+eq('level rsrp', ml.signal_level({ rsrp: -91, csq: 5 }), 3);
+eq('level rsrp weak', ml.signal_level({ rsrp: -110 }), 1);
+eq('level csq fallback', ml.signal_level({ csq: 12 }), 2);
+eq('level none', ml.signal_level({}), 0);
+eq('cops', ml.parse_cops(['+COPS: 0,0,"Telstra Mobile",7']), { operator: 'Telstra Mobile', act: 'LTE' });
+eq('cops unregistered', ml.parse_cops(['+COPS: 0']), {});
+eq('cereg', ml.parse_reg(['+CEREG: 0,5']), 'roaming');
+eq('utc epoch', ml.utc_epoch('2026-11-06 01:02:03'), 1793926923);
+eq('utc epoch leap', ml.utc_epoch('2024-02-29 00:00:00'), 1709164800);
+
+eq('merge multipart', ml.merge_parts([
+	{ index: 3, sender: '61400', timestamp: '2026-11-06 01:00:00', reference: 9, part: 2, total: 2, content: 'world' },
+	{ index: 1, sender: '61400', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'hello ' },
+	{ index: 2, sender: 'Telstra', timestamp: '2026-11-06 02:00:00', content: 'single' },
+	{ index: 4, error: 'error decoding pdu', sender: '', timestamp: '', content: '' }
+]), [
+	{ indexes: [2], sender: 'Telstra', timestamp: '2026-11-06 02:00:00', text: 'single', parts: 1, total: 1, complete: true },
+	{ indexes: [1, 3], sender: '61400', timestamp: '2026-11-06 01:00:00', text: 'hello world', parts: 2, total: 2, complete: true }
+]);
+
+// The 8-bit reference repeats; a second message with it stays separate.
+eq('merge reused reference', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 2, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 2, total: 2, content: 'a2' },
+	{ index: 6, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 2, total: 2, content: 'b2' },
+	{ index: 5, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 1, total: 2, content: 'b1' }
+]), m => [m.indexes, m.text, m.complete]), [[[5, 6], 'b1b2', true], [[1, 2], 'a1a2', true]]);
+// Storage slots are reused, so index order is not arrival order.
+eq('merge reused reference, reused slots', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 1, total: 2, content: 'b1' },
+	{ index: 5, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 6, sender: 'X', timestamp: '2026-11-06 01:00:01', reference: 9, part: 2, total: 2, content: 'a2' },
+	{ index: 7, sender: 'X', timestamp: '2026-11-06 03:00:01', reference: 9, part: 2, total: 2, content: 'b2' }
+]), m => [m.indexes, m.text]), [[[1, 7], 'b1b2'], [[5, 6], 'a1a2']]);
+// A part left over from an old message is not joined to a newer one.
+eq('merge leftover part', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 3, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 1, total: 2, content: 'b1' },
+	{ index: 4, sender: 'X', timestamp: '2026-11-06 03:00:02', reference: 9, part: 2, total: 2, content: 'b2' }
+]), m => [m.indexes, m.text, m.complete]), [[[3, 4], 'b1b2', true], [[1], 'a1', false]]);
+eq('merge lost last part, next message soon after', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 2, sender: 'X', timestamp: '2026-11-06 01:05:00', reference: 9, part: 1, total: 2, content: 'b1' },
+	{ index: 3, sender: 'X', timestamp: '2026-11-06 01:05:01', reference: 9, part: 2, total: 2, content: 'b2' }
+]), m => [m.indexes, m.text, m.complete]), [[[2, 3], 'b1b2', true], [[1], 'a1', false]]);
+
+/* ---- Slack message (lazysms layout) -------------------------------------- */
+
+const ZWSP = '​';
+eq('escape entities', ml.slack_escape('<script>&"'), '&lt;script&gt;&amp;"');
+eq('escape breaks formatting pairs', ml.slack_escape('*b* _i_ ~s~ `c`'),
+	`*${ZWSP}b*${ZWSP} _${ZWSP}i_${ZWSP} ~${ZWSP}s~${ZWSP} \`${ZWSP}c\`${ZWSP}`);
+eq('escape plain text unchanged', ml.slack_escape('Your code is 123456'), 'Your code is 123456');
+eq('truncate counts characters', ml.truncate('ééééé', 3, false), 'ééé');
+eq('truncate ellipsis', ml.truncate('abcdefgh', 6, true), 'abc...');
+eq('truncate short unchanged', ml.truncate('abc', 6, true), 'abc');
+eq('local time UTC', ml.local_time('2026-11-06 05:20:35'), '2026-11-06 05:20:35 (UTC+00:00)');
+eq('local time AEDT', trim(sh(`TZ='AEST-10AEDT,M10.1.0,M4.1.0/3' ucode -L /usr/share/ucode -e 'print(require("modemlite").local_time("2026-11-06 05:20:35"))'`)),
+	'2026-11-06 16:20:35 (UTC+11:00)');
+
+let sample = { sender: '+61400000001', timestamp: '2024-11-15 22:23:59', text: 'Call *me* <now> & `x`', complete: true, parts: 1, total: 1 };
+let msg = ml.slack_message({ slack: { label: 'Shed Modem' } }, sample);
+
+eq('message block layout', map(msg.blocks, b => b.text ? [b.type, b.text.type] : [b.type]),
+	[['section', 'mrkdwn'], ['section', 'plain_text'], ['context']]);
+eq('message sender bold', msg.blocks[0].text.text, '📱 *+61400000001*');
+eq('message body verbatim plain_text', msg.blocks[1].text.text, sample.text);
+eq('message context', map(msg.blocks[2].elements, e => e.text), ['🕒 2024-11-15 22:23:59 (UTC+00:00)', 'Shed Modem']);
+ok('message fallback escaped with label', index(msg.text, '📱 SMS from +61400000001 - Shed Modem: Call *') == 0 &&
+	index(msg.text, '&lt;now&gt; &amp;') > 0 && index(msg.text, '<now>') < 0);
+eq('message label defaults to hostname', ml.slack_message({ slack: {} }, sample).blocks[2].elements[1].text,
+	trim(fs.readfile('/proc/sys/kernel/hostname')));
+eq('message hostile sender', ml.slack_message({ slack: {} }, { ...sample, sender: '<script>&' }).blocks[0].text.text,
+	'📱 *&lt;script&gt;&amp;*');
+let long = ml.slack_message({ slack: {} }, { ...sample, text: sprintf('%03500d', 0), sender: sprintf('%0200d', 0) });
+ok('message body truncated to 3000', length(long.blocks[1].text.text) == 3000 && substr(long.blocks[1].text.text, -3) == '...');
+ok('message sender truncated to 150', length(long.blocks[0].text.text) <= 160);
+eq('message incomplete note', ml.slack_message({ slack: {} }, { ...sample, complete: false, parts: 1, total: 3 }).blocks[2].elements[2].text,
+	'incomplete: 1 of 3 parts');
+
+/* ---- Data call: default stock state (context 2 stored, inactive) --------- */
+
+reset();
+let st = ml.cycle(cfg());
+let log = at_log();
+
+ok('connect: CGACT before QNETDEVCTL', index(log, '/dev/ttyUSB1 AT+CGACT=1,2') >= 0 &&
+	index(log, '/dev/ttyUSB1 AT+CGACT=1,2') < index(log, '/dev/ttyUSB1 AT+QNETDEVCTL=1,2,1'));
+eq('connect: status', [st.present, st.port, st.netdev, st.cid, st.apn, st.connected, st.autoconnect],
+	[true, '/dev/ttyUSB1', 'usb0', 2, 'telstra.internet', true, true]);
+eq('status: identity', [st.manufacturer, st.model, st.imei, st.iccid], ['Quectel', 'EC200A', '861234567890123', '89610123456789012345']);
+eq('status: radio', [st.rsrp, st.rsrq, st.operator, st.act, st.registration, st.sim, st.level],
+	[-91, -10.0, 'Telstra Mobile', 'LTE', 'home', 'READY', 3]);
+eq('leds', map([1, 2, 3], i => trim(fs.readfile(`${getenv('MODEMLITE_SYSROOT')}/sys/class/leds/green:signal${i}/brightness`))), ['1', '1', '1']);
+ok('APN never written when unset', !length(filter(log, l => match(l, /QICSGP|CGDCONT=/))));
+eq('status file round-trip', ml.read_status(cfg()).imei, '861234567890123');
+
+// Second cycle: link up, nothing re-dialled and identity cached.
+sh(`rm ${FAKE}/at.log`);
+ml.cycle(cfg());
+log = at_log();
+ok('steady state: no dial', !length(filter(log, l => match(l, /CGACT=|QNETDEVCTL=/))));
+ok('steady state: identity cached', !length(filter(log, l => match(l, /CGSN/))));
+
+// Not managed: wan on another proto, or autoconnect off.
+for (let c in [cfg(null, null, { proto: 'ncm', device: '/dev/ttyUSB2' }), cfg({ autoconnect: '0' })]) {
+	reset();
+	st = ml.cycle(c);
+	ok('unmanaged: no dial', !length(filter(at_log(), l => match(l, /CGACT=|QNETDEVCTL=/))) && !st.connected && !st.autoconnect);
+}
+
+// Manual reconnect works regardless.
+reset('2 1');
+sh(`echo 2 > ${FAKE}/active`);
+st = ml.cycle(cfg({ autoconnect: '0' }), { force_connect: true });
+ok('force connect re-dials', st.connected && length(filter(at_log(), l => match(l, /QNETDEVCTL=1,2,1/))) == 1);
+
+/* ---- APN, auth, PIN ------------------------------------------------------ */
+
+reset('2 1');
+sh(`echo 2 > ${FAKE}/active`);
+st = ml.cycle(cfg({ apn: 'new.apn', pdptype: 'IP', auth: 'pap', username: 'u', password: 'p' }));
+log = at_log();
+ok('apn: QICSGP written', index(log, '/dev/ttyUSB1 AT+QICSGP=2,1,"new.apn","u","p",1') >= 0);
+ok('apn: old bearer dropped then reconnected', index(log, '/dev/ttyUSB1 AT+CGACT=0,2') >= 0 && st.connected);
+eq('apn: status shows new APN', [st.apn, st.pdp], ['new.apn', 'IP']);
+sh(`rm ${FAKE}/at.log`);
+ml.cycle(cfg({ apn: 'new.apn', pdptype: 'IP', auth: 'pap', username: 'u', password: 'p' }));
+ok('apn: applied once', !length(filter(at_log(), l => match(l, /QICSGP/))));
+
+reset();
+// Fallback to 3GPP commands when QICSGP is not supported.
+let r = sh(`FAKE_NO_QICSGP=1 ucode -L /usr/share/ucode -e 'let ml = require("modemlite"); ml.cycle({ modem: { apn: "fb.apn", pdptype: "IPV4V6", auth: "chap", username: "a", password: "b" }, slack: {}, wan: {} }); print("done")'`);
+log = at_log();
+ok('apn fallback: CGDCONT + CGAUTH', r == 'done' && index(log, '/dev/ttyUSB1 AT+CGDCONT=2,"IPV4V6","fb.apn"') >= 0 &&
+	index(log, '/dev/ttyUSB1 AT+CGAUTH=2,2,"a","b"') >= 0);
+
+reset();
+ml.cycle(cfg({ apn: 'telstra.internet', auth: 'chap', username: 'u', password: 'p' }));
+sh(`rm -f ${FAKE}/at.log`);
+ml.cycle(cfg({ apn: 'telstra.internet', auth: 'none' }));
+ok('apn: switching auth to none clears it', index(join('\n', at_log()), 'AT+QICSGP=2,3,"telstra.internet","","",0') >= 0);
+
+// Contexts unreadable (SIM busy): no guessing which context to overwrite.
+reset();
+sh(`FAKE_CGDCONT_ERR=1 ucode -L /usr/share/ucode -e 'require("modemlite").cycle({ modem: { apn: "x.apn" }, slack: {}, wan: {} })'`);
+ok('apn: not written while contexts are unreadable', !length(filter(at_log(), l => match(l, /QICSGP|CGDCONT=/))));
+
+// Only IMS stored: the APN goes to a free context, not over IMS.
+reset();
+fs.writefile(FAKE + '/apn', 'ims');
+ml.cycle(cfg({ apn: 'x.apn' }));
+ok('apn: free context used when only IMS is stored', index(join('\n', at_log()), 'AT+QICSGP=1,3,"x.apn"') >= 0);
+
+// A stored context with an empty APN (network default) is the data context.
+reset();
+fs.writefile(FAKE + '/apn', '');
+ml.cycle(cfg({ apn: 'x.apn' }));
+ok('apn: empty-APN context reused', index(join('\n', at_log()), 'AT+QICSGP=2,3,"x.apn"') >= 0);
+
+reset();
+ml.cycle(cfg({ apn: 'bad"apn' }));
+ok('apn: quotes rejected', !length(filter(at_log(), l => match(l, /QICSGP|CGDCONT=/))));
+
+reset();
+fs.writefile(FAKE + '/cpin', '+CPIN: SIM PIN');
+st = ml.cycle(cfg({ pin: '9999' }));
+ml.cycle(cfg({ pin: '9999' }));
+eq('pin: wrong PIN tried once only', length(filter(at_log(), l => match(l, /CPIN="/))), 1);
+st = ml.cycle(cfg({ pin: '1234' }));
+eq('pin: new PIN unlocks', st.sim, 'READY');
+fs.writefile(FAKE + '/cpin', '+CPIN: SIM PIN');	// modem reset
+st = ml.cycle(cfg({ pin: '1234' }));
+eq('pin: entered again after modem reset', st.sim, 'READY');
+
+reset();
+sh(`FAKE_NO_QICSGP=1 ucode -L /usr/share/ucode -e 'require("modemlite").cycle({ modem: { apn: "x.apn", pdptype: "IP\\";X" }, slack: {}, wan: {} })'`);
+ok('apn: unknown pdp type not sent', index(join('\n', at_log()), 'AT+CGDCONT=2,"IPV4V6","x.apn"') >= 0 &&
+	index(join('\n', at_log()), ';X') < 0);
+
+/* ---- SMS ------------------------------------------------------------------ */
+
+reset();
+add_sms(0, '"sender":"61412345678","timestamp":"2026-11-06 01:00:00","content":"Hello \\u00e9"');
+add_sms(1, '"sender":"Telstra","timestamp":"2026-11-06 02:00:00","reference":5,"part":1,"total":2,"content":"Part one, "');
+add_sms(2, '"sender":"Telstra","timestamp":"2026-11-06 02:00:00","reference":5,"part":2,"total":2,"content":"part two"');
+let l = ml.sms_list(cfg());
+eq('sms list', map(l.messages, m => [m.indexes, m.sender, m.text]),
+	[[[1, 2], 'Telstra', 'Part one, part two'], [[0], '61412345678', 'Hello é']]);
+
+// SMS-DELIVER as received on the MB118-4G (sender replaced): SCTS
+// 26-11-06 15:20:35, zone octet 0x04 = +40 quarter hours (+10:00).
+const PDU_AEST = '07911614786072F5040B911604000000F00000621160510253040' + '4D4F29C0E';
+
+eq('pdu tz +10:00', ml.pdu_tz(PDU_AEST), 600);
+eq('pdu tz -05:00', ml.pdu_tz(replace(PDU_AEST, '62116051025304', '6211605102530A')), -300);
+eq('pdu tz alphanumeric sender', ml.pdu_tz('07911614786072F5040ED0D4F29C0E9A36A70000621160510253040' + '4D4F29C0E'), 600);
+eq('pdu tz not deliver', ml.pdu_tz('0001000B911604000000F0000004D4F29C0E'), null);
+eq('pdu tz truncated', ml.pdu_tz('07911614786072F5040B91'), null);
+eq('to_utc', ml.to_utc('2026-11-06 15:20:35', 600), '2026-11-06 05:20:35');
+eq('to_utc west', ml.to_utc('2026-11-06 15:20:35', -300), '2026-11-06 20:20:35');
+eq('to_utc day rollover', ml.to_utc('2026-01-01 05:00:00', 600), '2025-12-31 19:00:00');
+eq('to_utc unknown zone', ml.to_utc('2026-11-06 15:20:35', null), '2026-11-06 15:20:35');
+
+add_sms(5, '"sender":"61400000000","timestamp":"2026-11-06 15:20:35","content":"Test"');
+fs.writefile(FAKE + '/pdu/5', PDU_AEST);
+eq('sms list reports UTC', map(filter(ml.sms_list(cfg()).messages, m => m.indexes[0] == 5), m => m.timestamp),
+	['2026-11-06 05:20:35']);
+eq('sms list keeps time without a zone', map(filter(ml.sms_list(cfg()).messages, m => m.indexes[0] == 0), m => m.timestamp),
+	['2026-11-06 01:00:00']);
+sh(`rm ${FAKE}/inbox/5 ${FAKE}/pdu/5`);
+
+eq('send ok', ml.sms_send(cfg(), '+61 412 345 678', 'Hi [there]'), { ok: true });
+eq('send recorded without +', trim(fs.readfile(FAKE + '/sent')), '61412345678\tHi [there]');
+eq('send national rejected', ml.sms_send(cfg(), '0412345678', 'x').error, 'Use the international number format, e.g. +61412345678');
+eq('send non-ascii rejected', ml.sms_send(cfg(), '61412345678', 'café').error, 'Only plain ASCII text can be sent');
+eq('send too long', ml.sms_send(cfg(), '61412345678', sprintf('%0159d', 0) + '^').error, 'Message must be 1 to 160 characters');
+eq('send 160 ok', ml.sms_send(cfg(), '61412345678', sprintf('%0160d', 0)), { ok: true });
+eq('send bad number', ml.sms_send(cfg(), 'abc', 'x').error, 'Invalid phone number');
+eq('send shell-safe', ml.sms_send(cfg(), '61412345678', "it's $(id) `x`"), { ok: true });
+ok('send shell-safe recorded verbatim', index(fs.readfile(FAKE + '/sent'), "it's $(id) `x`") >= 0);
+
+eq('delete', ml.sms_delete(cfg(), '1,2'), { ok: true });
+eq('delete missing', ml.sms_delete(cfg(), '9').error, 'Could not delete message 9');
+eq('list after delete', length(ml.sms_list(cfg()).messages), 1);
+
+/* ---- Slack ---------------------------------------------------------------- */
+
+let slack = { enabled: '1', webhook: 'https://hooks.slack.com/services/T/B/X' };
+
+reset();
+add_sms(0, '"sender":"61400000001","timestamp":"2026-11-06 01:00:00","content":"old"');
+ml.forward_new(cfg(null, slack));
+ok('forward: existing messages seeded, not posted', !fs.access(FAKE + '/posts') && length(trim(fs.readfile('/tmp/ml-forwarded'))) > 0);
+
+add_sms(1, '"sender":"61400000002","timestamp":"2026-11-06 01:05:00","content":"new \\"quoted\\" <msg>"');
+ml.forward_new(cfg(null, slack));
+let posts = split(trim(fs.readfile(FAKE + '/posts')), '\n');
+ok('forward: one post', length(filter(posts, x => x == '--')) == 1);
+ok('forward: url and header', 'https://hooks.slack.com/services/T/B/X' in posts && 'Content-Type: application/json' in posts);
+let body = json(posts[index(posts, '--post-data') + 1]);
+eq('forward: payload', [body.username, body.icon_emoji, body.blocks[0].text.text, body.blocks[1].text.text],
+	['modem-lite', ':iphone:', '📱 *61400000002*', 'new "quoted" <msg>']);
+
+ml.forward_new(cfg(null, slack));
+eq('forward: not repeated', length(filter(split(trim(fs.readfile(FAKE + '/posts')), '\n'), x => x == '--')), 1);
+
+// Incomplete multipart: held back while recent, sent after the grace period.
+add_sms(2, sprintf('"sender":"6140003","timestamp":"%s","reference":1,"part":1,"total":2,"content":"half"',
+	trim(sh('date -u "+%Y-%m-%d %H:%M:%S"'))));
+add_sms(3, '"sender":"6140004","timestamp":"2020-01-01 00:00:00","reference":2,"part":1,"total":2,"content":"stale half"');
+ml.forward_new(cfg(null, slack));
+posts = fs.readfile(FAKE + '/posts');
+ok('forward: recent incomplete held', index(posts, '6140003') < 0);
+ok('forward: stale incomplete sent', index(posts, 'incomplete: 1 of 2 parts') >= 0);
+
+// Failure: not marked, retried next time.
+reset();
+add_sms(0, '"sender":"1","timestamp":"2026-11-06 01:00:00","content":"a"');
+ml.forward_new(cfg(null, slack));
+// Newer than "a", so it is listed first; a failed post must not make the
+// older, already forwarded "a" look new.
+add_sms(1, '"sender":"2","timestamp":"2026-11-06 01:05:00","content":"b"');
+sh(`rm -f ${FAKE}/posts`);
+r = sh(`FAKE_FETCH_RC=4 ucode -L /usr/share/ucode -e 'let ml = require("modemlite"); ml.forward_new({ modem: {}, slack: ${sprintf('%J', slack)}, wan: {} })'`);
+ml.forward_new(cfg(null, slack));
+eq('forward: retried after failure', length(filter(split(trim(fs.readfile(FAKE + '/posts')), '\n'), x => x == '--')), 2);
+ok('forward: older message not reposted after failure', index(fs.readfile(FAKE + '/posts'), '📱 *1*') < 0);
+
+// A failed raw read must not change the message keys (and repost everything).
+eq('sms list fails without raw PDUs', sh(`FAKE_RAW_FAIL=1 ucode -L /usr/share/ucode -e 'print(require("modemlite").sms_list({ modem: {}, slack: {}, wan: {} }).error)'`),
+	'Could not read messages from the modem');
+
+// An inbox that reads back empty for a moment must not forget what was sent.
+sh(`mkdir -p ${FAKE}/hold && mv ${FAKE}/inbox/* ${FAKE}/hold/`);
+ml.forward_new(cfg(null, slack));
+sh(`mv ${FAKE}/hold/* ${FAKE}/inbox/ && rm -f ${FAKE}/posts`);
+ml.forward_new(cfg(null, slack));
+ok('forward: empty read keeps state', !fs.access(FAKE + '/posts'));
+
+// Delete after forwarding.
+add_sms(2, '"sender":"3","timestamp":"2026-11-06 01:00:00","content":"c"');
+ml.forward_new(cfg(null, { ...slack, delete: '1' }));
+ok('forward: deleted after post', !fs.access(FAKE + '/inbox/2'));
+
+// Disabling clears the state so re-enabling does not flood the channel.
+ml.forward_new(cfg(null, { enabled: '0' }));
+ok('forward: disable clears state', !fs.access('/tmp/ml-forwarded'));
+
+eq('forward manual', ml.sms_forward(cfg(null, slack), '0'), { ok: true });
+eq('forward manual missing', ml.sms_forward(cfg(null, slack), '42').error, 'Message not found');
+eq('slack unconfigured', ml.slack_test(cfg()).error, 'Slack webhook URL is not configured');
+eq('slack test', ml.slack_test(cfg(null, slack)), { ok: true });
+
+/* ---- Modem absent --------------------------------------------------------- */
+
+reset();
+st = ml.cycle(cfg({ at_port: '/dev/does-not-exist' }));
+eq('absent: status', st.present, false);
+eq('absent: leds off', map([1, 2, 3], i => trim(fs.readfile(`${getenv('MODEMLITE_SYSROOT')}/sys/class/leds/green:signal${i}/brightness`))), ['0', '0', '0']);
+eq('absent: sms', ml.sms_list(cfg({ sms_port: '/dev/does-not-exist' })).error, 'Modem SMS port not found');
+
+printf('%d/%d checks passed\n', count - failures, count);
+exit(failures ? 1 : 0);

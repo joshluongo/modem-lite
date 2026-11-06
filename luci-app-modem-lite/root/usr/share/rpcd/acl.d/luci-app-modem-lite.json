@@ -1,0 +1,17 @@
+{
+	"luci-app-modem-lite": {
+		"description": "Grant access to mobile modem settings, status and SMS",
+		"read": {
+			"ubus": {
+				"modem-lite": [ "status", "sms_list" ]
+			},
+			"uci": [ "modem-lite" ]
+		},
+		"write": {
+			"ubus": {
+				"modem-lite": [ "connect", "restart", "sms_send", "sms_delete", "sms_forward", "slack_test" ]
+			},
+			"uci": [ "modem-lite" ]
+		}
+	}
+}

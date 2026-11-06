@@ -1,0 +1,13 @@
+
+config modem 'modem'
+	option autoconnect '1'
+	option pdptype 'IPV4V6'
+	option auth 'none'
+	option interval '15'
+	list signal_led 'green:signal1'
+	list signal_led 'green:signal2'
+	list signal_led 'green:signal3'
+
+config slack 'slack'
+	option enabled '0'
+	option delete '0'

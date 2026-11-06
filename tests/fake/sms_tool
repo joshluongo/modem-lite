@@ -1,0 +1,94 @@
+#!/bin/sh
+# Fake sms_tool emulating the EC200A replies recorded in the MB118-4G notes.
+# State lives in $FAKE: link ("<cid> <state>"), active (cids), apn, inbox/<n>
+# (JSON fields), pdu/<n> (raw PDU for "-r recv"), sent, at.log.
+
+dev= json= raw= cmd=
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-d) dev=$2; shift 2 ;;
+	-f|-s|-b|-c) shift 2 ;;
+	-j) json=1; shift ;;
+	-r) raw=1; shift ;;
+	-*) shift ;;
+	*) cmd=$1; shift; break ;;
+	esac
+done
+
+[ -n "$FAKE_DEAD" ] && { echo "No response from modem." >&2; exit 2; }
+
+case "$cmd" in
+at)
+	c=$1
+	echo "$dev $c" >> "$FAKE/at.log"
+	echo "$c"	# modem echo (ATE1)
+	read -r lcid lstate < "$FAKE/link"
+	apn=$(cat "$FAKE/apn")
+	case "$c" in
+	AT+CGMI) echo Quectel ;;
+	AT+CGMM) echo EC200A ;;
+	AT+CGMR) echo EC200AELLAR01A05M16_TP ;;
+	AT+CGSN) echo 861234567890123 ;;
+	AT+QCCID) echo "+QCCID: 89610123456789012345" ;;
+	AT+CPIN\?) cat "$FAKE/cpin" ;;
+	AT+CPIN=*) [ "$c" = 'AT+CPIN="1234"' ] && { echo "+CPIN: READY" > "$FAKE/cpin"; } || { echo "+CME ERROR: 16"; exit 1; } ;;
+	AT+CGDCONT\?)
+		[ -n "$FAKE_CGDCONT_ERR" ] && { echo "+CME ERROR: 14"; exit 1; }
+		echo "+CGDCONT: 2,\"$(cat "$FAKE/pdp")\",\"$apn\",\"0.0.0.0\",0,0"
+		echo '+CGDCONT: 8,"IPV4V6","ims","0.0.0.0",0,0' ;;
+	AT+QNETDEVCTL\?) echo "+QNETDEVCTL: 1,$lcid,1,$lstate" ;;
+	AT+CGACT=1,*) echo "${c#AT+CGACT=1,}" >> "$FAKE/active" ;;
+	AT+CGACT=0,*) sed -i "/^${c#AT+CGACT=0,}\$/d" "$FAKE/active" ;;
+	AT+QNETDEVCTL=1,*)
+		cid=$(echo "$c" | cut -d, -f2)
+		grep -qx "$cid" "$FAKE/active" || { echo "+CME ERROR: 0"; exit 1; }
+		echo "$cid 1" > "$FAKE/link" ;;
+	AT+QNETDEVCTL=0,*) echo "0 0" > "$FAKE/link"; echo ERROR; exit 1 ;;
+	AT+QICSGP=*)
+		[ -n "$FAKE_NO_QICSGP" ] && { echo ERROR; exit 1; }
+		echo "$c" | cut -d'"' -f2 > "$FAKE/apn"
+		case "$c" in *,1,*) echo IP ;; *,2,*) echo IPV6 ;; *) echo IPV4V6 ;; esac > "$FAKE/pdp"
+		;;
+	AT+CGDCONT=*) echo "$c" | cut -d'"' -f4 > "$FAKE/apn"; echo "$c" | cut -d'"' -f2 > "$FAKE/pdp" ;;
+	AT+CGAUTH=*) ;;
+	AT+CESQ) echo "+CESQ: 51,99,255,255,20,50" ;;
+	AT+CSQ) echo "+CSQ: 27,99" ;;
+	AT+COPS\?) echo '+COPS: 0,0,"Telstra Mobile",7' ;;
+	AT+CEREG\?) echo "+CEREG: 0,1" ;;
+	AT+CFUN=1,1) ;;
+	*) echo ERROR; exit 1 ;;
+	esac
+	exit 0
+	;;
+recv)
+	if [ -n "$raw" ] && [ -z "$json" ]; then
+		[ -n "$FAKE_RAW_FAIL" ] && { echo "No response from modem." >&2; exit 2; }
+		for f in $(ls "$FAKE/inbox" 2>/dev/null | sort -n); do
+			echo "MSG: $f"
+			cat "$FAKE/pdu/$f" 2>/dev/null || echo 00
+			echo
+		done
+		exit 0
+	fi
+	printf '{"msg":['
+	sep=
+	for f in $(ls "$FAKE/inbox" 2>/dev/null | sort -n); do
+		printf '%s{"index":%s,%s}' "$sep" "$f" "$(cat "$FAKE/inbox/$f")"
+		sep=,
+	done
+	printf ']}\n'
+	;;
+send)
+	printf '%s\t%s\n' "$1" "$2" >> "$FAKE/sent"
+	echo "sms sent sucessfully: 7"
+	;;
+delete)
+	echo "delete msg from $1 to $1"
+	if [ -e "$FAKE/inbox/$1" ]; then
+		rm "$FAKE/inbox/$1"
+		echo "Deleted message $1"
+	else
+		echo "Error deleting message $1: 321"
+	fi
+	;;
+esac

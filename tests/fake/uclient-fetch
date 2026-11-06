@@ -1,0 +1,9 @@
+#!/bin/sh
+# Fake uclient-fetch: records each request (all args, one per line) in
+# $FAKE/posts, separated by "--", and exits with $FAKE_FETCH_RC (default 0).
+for a in "$@"; do
+	printf '%s\n' "$a"
+done >> "$FAKE/posts"
+echo -- >> "$FAKE/posts"
+[ "${FAKE_FETCH_RC:-0}" = 0 ] || echo "HTTP error 404" >&2
+exit "${FAKE_FETCH_RC:-0}"

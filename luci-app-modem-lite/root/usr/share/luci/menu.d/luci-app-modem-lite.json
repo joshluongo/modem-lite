@@ -1,0 +1,44 @@
+{
+	"admin/network/modem": {
+		"title": "Mobile Modem",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "modem-lite/modem"
+		},
+		"depends": {
+			"acl": [ "luci-app-modem-lite" ],
+			"uci": { "modem-lite": true }
+		}
+	},
+
+	"admin/sms": {
+		"title": "SMS",
+		"order": 55,
+		"action": {
+			"type": "firstchild",
+			"recurse": true
+		},
+		"depends": {
+			"acl": [ "luci-app-modem-lite" ]
+		}
+	},
+
+	"admin/sms/messages": {
+		"title": "Messages",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "modem-lite/sms"
+		}
+	},
+
+	"admin/sms/slack": {
+		"title": "Slack Forwarding",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "modem-lite/slack"
+		}
+	}
+}

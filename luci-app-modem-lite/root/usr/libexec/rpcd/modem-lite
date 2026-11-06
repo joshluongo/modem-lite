@@ -1,0 +1,68 @@
+#!/usr/bin/ucode
+// rpcd exec plugin "modem-lite" (ubus object) used by the LuCI views.
+// Runs in its own process, so slow modem I/O never blocks rpcd.
+
+'use strict';
+
+let fs = require('fs');
+let ml = require('modemlite');
+
+const methods = {
+	status: {
+		args: {},
+		call: (cfg) => ml.read_status(cfg)
+	},
+	connect: {
+		args: {},
+		call: (cfg) => {
+			let st = ml.cycle(cfg, { force_connect: true });
+
+			return st.present ? { ok: true, connected: st.connected } : { error: 'Modem AT port not found' };
+		}
+	},
+	restart: {
+		args: {},
+		call: (cfg) => ml.restart_modem(cfg)
+	},
+	sms_list: {
+		args: {},
+		call: (cfg) => ml.sms_list(cfg)
+	},
+	sms_send: {
+		args: { number: 'str', text: 'str' },
+		call: (cfg, a) => ml.sms_send(cfg, a.number, a.text)
+	},
+	sms_delete: {
+		args: { indexes: 'str' },
+		call: (cfg, a) => ml.sms_delete(cfg, a.indexes)
+	},
+	sms_forward: {
+		args: { indexes: 'str' },
+		call: (cfg, a) => ml.sms_forward(cfg, a.indexes)
+	},
+	slack_test: {
+		args: {},
+		call: (cfg) => ml.slack_test(cfg)
+	}
+};
+
+if (ARGV[0] == 'list') {
+	let sig = {};
+
+	for (let name, m in methods)
+		sig[name] = m.args;
+
+	printf('%J\n', sig);
+}
+else if (ARGV[0] == 'call' && methods[ARGV[1]]) {
+	let args = {};
+
+	try {
+		args = json(fs.stdin.read('all') || '{}') ?? {};
+	}
+	catch (e) {
+		args = {};
+	}
+
+	printf('%J\n', methods[ARGV[1]].call(ml.config(), args));
+}

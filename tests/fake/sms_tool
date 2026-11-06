@@ -33,6 +33,7 @@ at)
 	AT+CPIN\?) cat "$FAKE/cpin" ;;
 	AT+CPIN=*) [ "$c" = 'AT+CPIN="1234"' ] && { echo "+CPIN: READY" > "$FAKE/cpin"; } || { echo "+CME ERROR: 16"; exit 1; } ;;
 	AT+CGDCONT\?)
+		[ -n "$FAKE_CGDCONT_ERR" ] && { echo "+CME ERROR: 14"; exit 1; }
 		echo "+CGDCONT: 2,\"$(cat "$FAKE/pdp")\",\"$apn\",\"0.0.0.0\",0,0"
 		echo '+CGDCONT: 8,"IPV4V6","ims","0.0.0.0",0,0' ;;
 	AT+QNETDEVCTL\?) echo "+QNETDEVCTL: 1,$lcid,1,$lstate" ;;
@@ -61,6 +62,7 @@ at)
 	;;
 recv)
 	if [ -n "$raw" ] && [ -z "$json" ]; then
+		[ -n "$FAKE_RAW_FAIL" ] && { echo "No response from modem." >&2; exit 2; }
 		for f in $(ls "$FAKE/inbox" 2>/dev/null | sort -n); do
 			echo "MSG: $f"
 			cat "$FAKE/pdu/$f" 2>/dev/null || echo 00

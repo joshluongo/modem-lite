@@ -366,14 +366,16 @@ function apply_apn(cfg, port, cid, ctx, link) {
 	if (!m.apn || !cid)
 		return false;
 
-	let pdp = m.pdptype ?? 'IPV4V6';
+	let pdp = (m.pdptype in ['IP', 'IPV6', 'IPV4V6']) ? m.pdptype : 'IPV4V6';
 	let auth = { none: 0, pap: 1, chap: 2 }[m.auth ?? 'none'] ?? 0;
 	let user = auth ? (m.username ?? '') : '';
 	let pass = auth ? (m.password ?? '') : '';
 	let sig = join('|', [cid, m.apn, pdp, auth, user, pass]);
 	let sigfile = RUNDIR + '/applied';
 
-	if (trim(fs.readfile(sigfile) ?? '') == sig)
+	let prev = fs.readfile(sigfile);
+
+	if (trim(prev ?? '') == sig)
 		return false;
 
 	if (!at_safe(m.apn) || !at_safe(user) || !at_safe(pass)) {
@@ -385,15 +387,18 @@ function apply_apn(cfg, port, cid, ctx, link) {
 	let changed = false;
 	let ok = true;
 
-	if (auth || !cur || cur.apn != m.apn || cur.pdp != pdp) {
+	// The modem does not report its auth settings, so write them whenever the
+	// settings changed since the last write (e.g. CHAP back to none).
+	if (auth || prev != null || !cur || cur.apn != m.apn || cur.pdp != pdp) {
 		ok = at(port, sprintf('AT+QICSGP=%d,%d,"%s","%s","%s",%d', cid,
 			{ IP: 1, IPV6: 2, IPV4V6: 3 }[pdp] ?? 3, m.apn, user, pass, auth)).ok;
 
 		if (!ok) {
 			ok = at(port, sprintf('AT+CGDCONT=%d,"%s","%s"', cid, pdp, m.apn)).ok;
 
-			if (ok && auth)
-				ok = at(port, sprintf('AT+CGAUTH=%d,%d,"%s","%s"', cid, auth, user, pass)).ok;
+			if (ok)
+				ok = at(port, auth ? sprintf('AT+CGAUTH=%d,%d,"%s","%s"', cid, auth, user, pass)
+					: sprintf('AT+CGAUTH=%d,0', cid)).ok;
 		}
 
 		changed = ok;
@@ -418,8 +423,9 @@ function apply_apn(cfg, port, cid, ctx, link) {
 	return changed;
 }
 
-// Enter the SIM PIN once per PIN value per boot, so a wrong PIN can never
-// use up the SIM's remaining attempts.
+// Enter a rejected SIM PIN only once per boot, so a wrong PIN can never use
+// up the SIM's remaining attempts. An accepted PIN is entered again after a
+// modem reset.
 function unlock_sim(cfg, port, sim) {
 	let pin = cfg.modem.pin;
 	let tried = RUNDIR + '/pin_tried';
@@ -434,6 +440,9 @@ function unlock_sim(cfg, port, sim) {
 	fs.writefile(tried, pin);
 
 	let ok = at(port, sprintf('AT+CPIN="%s"', pin)).ok;
+
+	if (ok)
+		fs.unlink(tried);
 
 	log(ok ? 'SIM unlocked' : 'SIM PIN rejected, not retrying until the PIN changes');
 
@@ -495,8 +504,23 @@ function cycle(cfg, opts) {
 	if (unlock_sim(cfg, port, st.sim))
 		st.sim = value_of(at(port, 'AT+CPIN?').lines, '+CPIN:');
 
-	let ctx = parse_cgdcont(at(port, 'AT+CGDCONT?').lines);
-	let cid = +cfg.modem.cid || data_cid(ctx) || (cfg.modem.apn ? 1 : null);
+	let cg = at(port, 'AT+CGDCONT?');
+	let ctx = parse_cgdcont(cg.lines);
+	let cid = +cfg.modem.cid || data_cid(ctx);
+
+	// No internet context stored: put the APN in a context with an empty APN
+	// (network default), else the first free one, but only when the list was
+	// read (never guess and overwrite IMS).
+	if (!cid && cfg.modem.apn && cg.ok) {
+		cid = filter(ctx, c => c.apn == '')[0]?.cid;
+
+		if (!cid) {
+			let used = map(ctx, c => c.cid);
+
+			for (cid = 1; cid in used; cid++)
+				;
+		}
+	}
 	let link = parse_link(at(port, 'AT+QNETDEVCTL?').lines);
 
 	if (apply_apn(cfg, port, cid, ctx, link)) {
@@ -669,25 +693,32 @@ function merge_parts(raw) {
 	}
 
 	for (let key, list in groups) {
-		list = sort(list, (a, b) => a.part - b.part);
+		// The 8-bit reference repeats: a part number seen again starts the next
+		// message with that reference, as does a part sent much later (its
+		// partner was lost). Storage slots are reused, so go by time.
+		let occ = [];
 
-		let seen = {}, text = '', indexes = [];
+		for (let p in sort(list, (a, b) => (a.timestamp > b.timestamp) - (a.timestamp < b.timestamp) || a.index - b.index)) {
+			let t = utc_epoch(p.timestamp) ?? 0;
+			let c = filter(occ, o => !o.seen[p.part] && t - o.t <= INCOMPLETE_GRACE);
+			let o = c[length(c) - 1];	// newest, so a lost last part stays lost
 
-		for (let p in list) {
-			push(indexes, p.index);
+			if (!o)
+				push(occ, o = { seen: {}, parts: [], t });
 
-			if (seen[p.part])
-				continue;
-
-			seen[p.part] = true;
-			text += p.content ?? '';
+			o.seen[p.part] = true;
+			push(o.parts, p);
 		}
 
-		push(out, {
-			indexes, sender: list[0].sender, timestamp: list[0].timestamp, text,
-			parts: length(keys(seen)), total: list[0].total,
-			complete: length(keys(seen)) >= list[0].total
-		});
+		for (let o in occ) {
+			let ps = sort(o.parts, (a, b) => a.part - b.part);
+
+			push(out, {
+				indexes: map(ps, p => p.index), sender: ps[0].sender, timestamp: ps[0].timestamp,
+				text: join('', map(ps, p => p.content ?? '')),
+				parts: length(ps), total: ps[0].total, complete: length(ps) >= ps[0].total
+			});
+		}
 	}
 
 	return sort(out, (a, b) => (a.timestamp < b.timestamp) - (a.timestamp > b.timestamp));
@@ -717,6 +748,11 @@ function sms_list(cfg) {
 	// from each raw PDU and report UTC.
 	let raw = run(sprintf('flock %s sms_tool -d %s -r recv 2>/dev/null',
 		q(lock_for(port)), q(port)));
+
+	// Without the zones the timestamps, and so the forwarding keys, would differ.
+	if (raw.code != 0)
+		return { error: 'Could not read messages from the modem' };
+
 	let zones = pdu_zones(raw.out);
 
 	for (let m in d.msg)
@@ -868,7 +904,7 @@ function slack_post(cfg, payload) {
 	payload.username = SLACK_USERNAME;
 	payload.icon_emoji = SLACK_ICON;
 
-	let r = run(sprintf('uclient-fetch -q -T 20 -O /dev/null --header %s --post-data %s %s 2>&1',
+	let r = run(sprintf('uclient-fetch -q -T 10 -O /dev/null --header %s --post-data %s %s 2>&1',
 		q('Content-Type: application/json'), q(sprintf('%J', payload)), q(url)));
 
 	return (r.code == 0) ? { ok: true } : { error: trim(r.out) || sprintf('Slack request failed (%d)', r.code) };
@@ -960,23 +996,24 @@ function forward_new(cfg) {
 
 	let raw = fs.readfile(FWD_STATE);
 	let first = (raw == null);
-	let seen = {}, present = {}, changed = first;
+	let seen = {}, present = {}, changed = first, down = false;
 
 	for (let k in split(raw ?? '', '\n'))
 		if (k != '')
 			seen[k] = true;
 
+	for (let m in l.messages)
+		present[msg_key(m)] = true;
+
 	for (let m in l.messages) {
 		let key = msg_key(m);
-
-		present[key] = true;
 
 		if (first) {
 			seen[key] = true;
 			continue;
 		}
 
-		if (seen[key])
+		if (seen[key] || down)
 			continue;
 
 		// Wait for the remaining parts of a multipart message for a while.
@@ -987,7 +1024,8 @@ function forward_new(cfg) {
 
 		if (r.error) {
 			log('Slack forwarding failed: ' + r.error);
-			break;
+			down = true;	// retry next pass
+			continue;
 		}
 
 		log(sprintf('forwarded SMS from %s to Slack', m.sender));
@@ -998,17 +1036,24 @@ function forward_new(cfg) {
 			delete present[key];
 	}
 
-	// Forget messages no longer on the modem, so the file stays small.
-	for (let k in keys(seen)) {
-		if (!present[k]) {
-			delete seen[k];
-			changed = true;
+	// Forget messages no longer on the modem, so the file stays small. An empty
+	// list may be a modem that is still starting, so it forgets nothing.
+	if (length(l.messages)) {
+		for (let k in keys(seen)) {
+			if (!present[k]) {
+				delete seen[k];
+				changed = true;
+			}
 		}
 	}
 
 	if (changed) {
+		let tmp = FWD_STATE + '.tmp';
+
 		fs.mkdir(fs.dirname(FWD_STATE));
-		fs.writefile(FWD_STATE, join('\n', sort(keys(seen))) + '\n');
+
+		if (fs.writefile(tmp, join('\n', sort(keys(seen))) + '\n'))
+			fs.rename(tmp, FWD_STATE);
 	}
 }
 

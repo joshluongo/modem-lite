@@ -75,8 +75,8 @@ release key.
 | `modem.apn` | (unset) | APN to write to the data context. Leave unset to keep the APN stored in the modem |
 | `modem.pdptype` | `IPV4V6` | `IP`, `IPV6` or `IPV4V6` |
 | `modem.auth`, `username`, `password` | `none` | `none`, `pap` or `chap` |
-| `modem.pin` | (unset) | SIM PIN, entered at most once per boot |
-| `modem.cid` | auto | Data context: first context with a non-IMS APN (2 on the MB118 stock profile) |
+| `modem.pin` | (unset) | SIM PIN. A rejected PIN is not entered again until it is changed or the router reboots |
+| `modem.cid` | auto | Data context: first context with a non-IMS APN (2 on the MB118 stock profile). Without one, the APN goes to a context with an empty APN, else the first free context |
 | `modem.at_port`, `modem.sms_port` | auto | tty on USB interface 3 / 4 |
 | `modem.interval` | `15` | Seconds between checks |
 | `modem.signal_led` | `green:signal1..3` | LEDs used as signal bars |
@@ -100,7 +100,7 @@ Limits that come from `sms-tool`:
 When Slack forwarding is first enabled, the messages already on the modem
 are recorded as seen and are not posted. Forwarding state is kept in
 `/etc/modem-lite/forwarded`, which is written only when a message is
-forwarded or disappears.
+forwarded or disappears, and is kept across `sysupgrade`.
 
 ## Tests
 

@@ -81,6 +81,32 @@ eq('merge multipart', ml.merge_parts([
 	{ indexes: [1, 3], sender: '61400', timestamp: '2026-11-06 01:00:00', text: 'hello world', parts: 2, total: 2, complete: true }
 ]);
 
+// The 8-bit reference repeats; a second message with it stays separate.
+eq('merge reused reference', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 2, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 2, total: 2, content: 'a2' },
+	{ index: 6, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 2, total: 2, content: 'b2' },
+	{ index: 5, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 1, total: 2, content: 'b1' }
+]), m => [m.indexes, m.text, m.complete]), [[[5, 6], 'b1b2', true], [[1, 2], 'a1a2', true]]);
+// Storage slots are reused, so index order is not arrival order.
+eq('merge reused reference, reused slots', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 1, total: 2, content: 'b1' },
+	{ index: 5, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 6, sender: 'X', timestamp: '2026-11-06 01:00:01', reference: 9, part: 2, total: 2, content: 'a2' },
+	{ index: 7, sender: 'X', timestamp: '2026-11-06 03:00:01', reference: 9, part: 2, total: 2, content: 'b2' }
+]), m => [m.indexes, m.text]), [[[1, 7], 'b1b2'], [[5, 6], 'a1a2']]);
+// A part left over from an old message is not joined to a newer one.
+eq('merge leftover part', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 3, sender: 'X', timestamp: '2026-11-06 03:00:00', reference: 9, part: 1, total: 2, content: 'b1' },
+	{ index: 4, sender: 'X', timestamp: '2026-11-06 03:00:02', reference: 9, part: 2, total: 2, content: 'b2' }
+]), m => [m.indexes, m.text, m.complete]), [[[3, 4], 'b1b2', true], [[1], 'a1', false]]);
+eq('merge lost last part, next message soon after', map(ml.merge_parts([
+	{ index: 1, sender: 'X', timestamp: '2026-11-06 01:00:00', reference: 9, part: 1, total: 2, content: 'a1' },
+	{ index: 2, sender: 'X', timestamp: '2026-11-06 01:05:00', reference: 9, part: 1, total: 2, content: 'b1' },
+	{ index: 3, sender: 'X', timestamp: '2026-11-06 01:05:01', reference: 9, part: 2, total: 2, content: 'b2' }
+]), m => [m.indexes, m.text, m.complete]), [[[2, 3], 'b1b2', true], [[1], 'a1', false]]);
+
 /* ---- Slack message (lazysms layout) -------------------------------------- */
 
 const ZWSP = '​';
@@ -173,6 +199,29 @@ ok('apn fallback: CGDCONT + CGAUTH', r == 'done' && index(log, '/dev/ttyUSB1 AT+
 	index(log, '/dev/ttyUSB1 AT+CGAUTH=2,2,"a","b"') >= 0);
 
 reset();
+ml.cycle(cfg({ apn: 'telstra.internet', auth: 'chap', username: 'u', password: 'p' }));
+sh(`rm -f ${FAKE}/at.log`);
+ml.cycle(cfg({ apn: 'telstra.internet', auth: 'none' }));
+ok('apn: switching auth to none clears it', index(join('\n', at_log()), 'AT+QICSGP=2,3,"telstra.internet","","",0') >= 0);
+
+// Contexts unreadable (SIM busy): no guessing which context to overwrite.
+reset();
+sh(`FAKE_CGDCONT_ERR=1 ucode -L /usr/share/ucode -e 'require("modemlite").cycle({ modem: { apn: "x.apn" }, slack: {}, wan: {} })'`);
+ok('apn: not written while contexts are unreadable', !length(filter(at_log(), l => match(l, /QICSGP|CGDCONT=/))));
+
+// Only IMS stored: the APN goes to a free context, not over IMS.
+reset();
+fs.writefile(FAKE + '/apn', 'ims');
+ml.cycle(cfg({ apn: 'x.apn' }));
+ok('apn: free context used when only IMS is stored', index(join('\n', at_log()), 'AT+QICSGP=1,3,"x.apn"') >= 0);
+
+// A stored context with an empty APN (network default) is the data context.
+reset();
+fs.writefile(FAKE + '/apn', '');
+ml.cycle(cfg({ apn: 'x.apn' }));
+ok('apn: empty-APN context reused', index(join('\n', at_log()), 'AT+QICSGP=2,3,"x.apn"') >= 0);
+
+reset();
 ml.cycle(cfg({ apn: 'bad"apn' }));
 ok('apn: quotes rejected', !length(filter(at_log(), l => match(l, /QICSGP|CGDCONT=/))));
 
@@ -183,6 +232,14 @@ ml.cycle(cfg({ pin: '9999' }));
 eq('pin: wrong PIN tried once only', length(filter(at_log(), l => match(l, /CPIN="/))), 1);
 st = ml.cycle(cfg({ pin: '1234' }));
 eq('pin: new PIN unlocks', st.sim, 'READY');
+fs.writefile(FAKE + '/cpin', '+CPIN: SIM PIN');	// modem reset
+st = ml.cycle(cfg({ pin: '1234' }));
+eq('pin: entered again after modem reset', st.sim, 'READY');
+
+reset();
+sh(`FAKE_NO_QICSGP=1 ucode -L /usr/share/ucode -e 'require("modemlite").cycle({ modem: { apn: "x.apn", pdptype: "IP\\";X" }, slack: {}, wan: {} })'`);
+ok('apn: unknown pdp type not sent', index(join('\n', at_log()), 'AT+CGDCONT=2,"IPV4V6","x.apn"') >= 0 &&
+	index(join('\n', at_log()), ';X') < 0);
 
 /* ---- SMS ------------------------------------------------------------------ */
 
@@ -264,11 +321,25 @@ ok('forward: stale incomplete sent', index(posts, 'incomplete: 1 of 2 parts') >=
 reset();
 add_sms(0, '"sender":"1","timestamp":"2026-11-06 01:00:00","content":"a"');
 ml.forward_new(cfg(null, slack));
-add_sms(1, '"sender":"2","timestamp":"2026-11-06 01:00:00","content":"b"');
+// Newer than "a", so it is listed first; a failed post must not make the
+// older, already forwarded "a" look new.
+add_sms(1, '"sender":"2","timestamp":"2026-11-06 01:05:00","content":"b"');
 sh(`rm -f ${FAKE}/posts`);
 r = sh(`FAKE_FETCH_RC=4 ucode -L /usr/share/ucode -e 'let ml = require("modemlite"); ml.forward_new({ modem: {}, slack: ${sprintf('%J', slack)}, wan: {} })'`);
 ml.forward_new(cfg(null, slack));
 eq('forward: retried after failure', length(filter(split(trim(fs.readfile(FAKE + '/posts')), '\n'), x => x == '--')), 2);
+ok('forward: older message not reposted after failure', index(fs.readfile(FAKE + '/posts'), '📱 *1*') < 0);
+
+// A failed raw read must not change the message keys (and repost everything).
+eq('sms list fails without raw PDUs', sh(`FAKE_RAW_FAIL=1 ucode -L /usr/share/ucode -e 'print(require("modemlite").sms_list({ modem: {}, slack: {}, wan: {} }).error)'`),
+	'Could not read messages from the modem');
+
+// An inbox that reads back empty for a moment must not forget what was sent.
+sh(`mkdir -p ${FAKE}/hold && mv ${FAKE}/inbox/* ${FAKE}/hold/`);
+ml.forward_new(cfg(null, slack));
+sh(`mv ${FAKE}/hold/* ${FAKE}/inbox/ && rm -f ${FAKE}/posts`);
+ml.forward_new(cfg(null, slack));
+ok('forward: empty read keeps state', !fs.access(FAKE + '/posts'));
 
 // Delete after forwarding.
 add_sms(2, '"sender":"3","timestamp":"2026-11-06 01:00:00","content":"c"');

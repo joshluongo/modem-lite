@@ -81,6 +81,12 @@ release key.
 | `modem.interval` | `15` | Seconds between checks |
 | `modem.signal_led` | `green:signal1..3` | LEDs used as signal bars |
 | `slack.enabled`, `slack.webhook`, `slack.delete` | off | SMS forwarding to Slack |
+| `slack.label` | hostname | Device label shown under each forwarded message |
+
+Forwarded messages use the same card layout as
+[lazysms](https://github.com/joshluongo/lazysms): 📱 bold sender, the body as
+plain text exactly as received, and a context line with the received time
+(router's local time zone) and the device label, posted as `modem-lite`.
 
 Limits that come from `sms-tool`:
 

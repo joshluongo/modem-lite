@@ -24,6 +24,9 @@ return view.extend({
 		o.password = true;
 		o.validate = (id, v) => (!v || /^https:\/\/[^\s'"]+$/.test(v)) ? true : _('Expecting an https:// URL');
 
+		o = s.option(form.Value, 'label', _('Device label'),
+			_('Shown under each message, e.g. "Shed Modem (+61400000000)". Default: the router\'s hostname.'));
+
 		o = s.option(form.Flag, 'delete', _('Delete after forwarding'),
 			_('Remove each message from the modem once Slack accepted it, so storage does not fill up.'));
 		o.rmempty = false;

@@ -81,8 +81,39 @@ eq('merge multipart', ml.merge_parts([
 	{ indexes: [1, 3], sender: '61400', timestamp: '2026-11-06 01:00:00', text: 'hello world', parts: 2, total: 2, complete: true }
 ]);
 
-eq('slack format escapes', ml.slack_format({ sender: '<b>', timestamp: 'T', text: 'a & <b>', complete: true }),
-	sprintf('*SMS from &lt;b&gt;* on %s, T UTC\na &amp; &lt;b&gt;', trim(fs.readfile('/proc/sys/kernel/hostname'))));
+/* ---- Slack message (lazysms layout) -------------------------------------- */
+
+const ZWSP = '​';
+eq('escape entities', ml.slack_escape('<script>&"'), '&lt;script&gt;&amp;"');
+eq('escape breaks formatting pairs', ml.slack_escape('*b* _i_ ~s~ `c`'),
+	`*${ZWSP}b*${ZWSP} _${ZWSP}i_${ZWSP} ~${ZWSP}s~${ZWSP} \`${ZWSP}c\`${ZWSP}`);
+eq('escape plain text unchanged', ml.slack_escape('Your code is 123456'), 'Your code is 123456');
+eq('truncate counts characters', ml.truncate('ééééé', 3, false), 'ééé');
+eq('truncate ellipsis', ml.truncate('abcdefgh', 6, true), 'abc...');
+eq('truncate short unchanged', ml.truncate('abc', 6, true), 'abc');
+eq('local time UTC', ml.local_time('2026-11-06 05:20:35'), '2026-11-06 05:20:35 (UTC+00:00)');
+eq('local time AEDT', trim(sh(`TZ='AEST-10AEDT,M10.1.0,M4.1.0/3' ucode -L /usr/share/ucode -e 'print(require("modemlite").local_time("2026-11-06 05:20:35"))'`)),
+	'2026-11-06 16:20:35 (UTC+11:00)');
+
+let sample = { sender: '+61400000001', timestamp: '2024-11-15 22:23:59', text: 'Call *me* <now> & `x`', complete: true, parts: 1, total: 1 };
+let msg = ml.slack_message({ slack: { label: 'Shed Modem' } }, sample);
+
+eq('message block layout', map(msg.blocks, b => b.text ? [b.type, b.text.type] : [b.type]),
+	[['section', 'mrkdwn'], ['section', 'plain_text'], ['context']]);
+eq('message sender bold', msg.blocks[0].text.text, '📱 *+61400000001*');
+eq('message body verbatim plain_text', msg.blocks[1].text.text, sample.text);
+eq('message context', map(msg.blocks[2].elements, e => e.text), ['🕒 2024-11-15 22:23:59 (UTC+00:00)', 'Shed Modem']);
+ok('message fallback escaped with label', index(msg.text, '📱 SMS from +61400000001 - Shed Modem: Call *') == 0 &&
+	index(msg.text, '&lt;now&gt; &amp;') > 0 && index(msg.text, '<now>') < 0);
+eq('message label defaults to hostname', ml.slack_message({ slack: {} }, sample).blocks[2].elements[1].text,
+	trim(fs.readfile('/proc/sys/kernel/hostname')));
+eq('message hostile sender', ml.slack_message({ slack: {} }, { ...sample, sender: '<script>&' }).blocks[0].text.text,
+	'📱 *&lt;script&gt;&amp;*');
+let long = ml.slack_message({ slack: {} }, { ...sample, text: sprintf('%03500d', 0), sender: sprintf('%0200d', 0) });
+ok('message body truncated to 3000', length(long.blocks[1].text.text) == 3000 && substr(long.blocks[1].text.text, -3) == '...');
+ok('message sender truncated to 150', length(long.blocks[0].text.text) <= 160);
+eq('message incomplete note', ml.slack_message({ slack: {} }, { ...sample, complete: false, parts: 1, total: 3 }).blocks[2].elements[2].text,
+	'incomplete: 1 of 3 parts');
 
 /* ---- Data call: default stock state (context 2 stored, inactive) --------- */
 
@@ -214,7 +245,8 @@ let posts = split(trim(fs.readfile(FAKE + '/posts')), '\n');
 ok('forward: one post', length(filter(posts, x => x == '--')) == 1);
 ok('forward: url and header', 'https://hooks.slack.com/services/T/B/X' in posts && 'Content-Type: application/json' in posts);
 let body = json(posts[index(posts, '--post-data') + 1]);
-ok('forward: payload', index(body.text, '*SMS from 61400000002*') == 0 && index(body.text, 'new "quoted" &lt;msg&gt;') > 0);
+eq('forward: payload', [body.username, body.icon_emoji, body.blocks[0].text.text, body.blocks[1].text.text],
+	['modem-lite', ':iphone:', '📱 *61400000002*', 'new "quoted" <msg>']);
 
 ml.forward_new(cfg(null, slack));
 eq('forward: not repeated', length(filter(split(trim(fs.readfile(FAKE + '/posts')), '\n'), x => x == '--')), 1);

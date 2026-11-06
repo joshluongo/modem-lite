@@ -628,6 +628,13 @@ function pdu_zones(out) {
 	return zones;
 }
 
+// "YYYY-MM-DD HH:MM:SS" in UTC for an epoch.
+function fmt_utc(t) {
+	let g = gmtime(t);
+
+	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', g.year, g.mon, g.mday, g.hour, g.min, g.sec);
+}
+
 // SMSC local "YYYY-MM-DD HH:MM:SS" plus zone (minutes) -> same format in UTC.
 function to_utc(ts, tz_minutes) {
 	let t = utc_epoch(ts);
@@ -635,9 +642,7 @@ function to_utc(ts, tz_minutes) {
 	if (t == null || tz_minutes == null)
 		return ts;
 
-	let g = gmtime(t - tz_minutes * 60);
-
-	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', g.year, g.mon, g.mday, g.hour, g.min, g.sec);
+	return fmt_utc(t - tz_minutes * 60);
 }
 
 // Join the parts of multipart messages: [{ indexes, sender, timestamp, text,
@@ -793,32 +798,105 @@ function sms_delete(cfg, indexes) {
 
 /* ---- Slack --------------------------------------------------------------- */
 
+// Message layout follows lazysms (github.com/joshluongo/lazysms): a compact
+// Block Kit card with the sender, the body as plain_text and a context line.
+const SLACK_USERNAME = 'modem-lite';
+const SLACK_ICON = ':iphone:';
+const SMS_EMOJI = '📱';
+const CLOCK_EMOJI = '🕒';
+const ZWSP = '​';
+const SENDER_MAX = 150;
+const SECTION_MAX = 3000;
+
+// Escape for Slack mrkdwn: & < > as entities, and a zero-width space after
+// * _ ~ ` (Slack has no backslash escape) so untrusted text cannot format.
 function slack_escape(s) {
-	return replace(replace(replace(s ?? '', '&', '&amp;'), '<', '&lt;'), '>', '&gt;');
+	s = replace(replace(replace(s ?? '', '&', '&amp;'), '<', '&lt;'), '>', '&gt;');
+
+	return replace(s, /[*_~`]/g, (c) => c + ZWSP);
+}
+
+// Truncate to at most <max> UTF-8 characters, optionally ending in "...".
+function truncate(s, max, ellipsis) {
+	let chars = 0, i = 0, n = length(s);
+	let limit = ellipsis ? max - 3 : max;
+	let cut = null;
+
+	for (; i < n; i++) {
+		if ((ord(s, i) & 0xc0) == 0x80)
+			continue;
+
+		if (chars == limit && cut == null)
+			cut = i;
+
+		if (++chars > max)
+			return substr(s, 0, cut ?? i) + (ellipsis ? '...' : '');
+	}
+
+	return s;
 }
 
 function hostname() {
 	return trim(fs.readfile('/proc/sys/kernel/hostname') ?? 'OpenWrt');
 }
 
-function slack_post(cfg, text) {
+// Router-local "YYYY-MM-DD HH:MM:SS (UTC+hh:mm)" for a UTC timestamp.
+function local_time(ts) {
+	let t = utc_epoch(ts);
+
+	if (t == null)
+		return ts ?? '';
+
+	let l = localtime(t);
+	let s = sprintf('%04d-%02d-%02d %02d:%02d:%02d', l.year, l.mon, l.mday, l.hour, l.min, l.sec);
+	let off = int((utc_epoch(s) - t) / 60);
+	let a = (off < 0) ? -off : off;
+
+	return sprintf('%s (UTC%s%02d:%02d)', s, off < 0 ? '-' : '+', int(a / 60), a % 60);
+}
+
+function slack_label(cfg) {
+	return cfg.slack.label || hostname();
+}
+
+function slack_post(cfg, payload) {
 	let url = cfg.slack.webhook;
 
 	if (!url || !match(url, /^https:\/\/[^ \t'"]+$/))
 		return { error: 'Slack webhook URL is not configured' };
 
+	payload.username = SLACK_USERNAME;
+	payload.icon_emoji = SLACK_ICON;
+
 	let r = run(sprintf('uclient-fetch -q -T 20 -O /dev/null --header %s --post-data %s %s 2>&1',
-		q('Content-Type: application/json'), q(sprintf('%J', { text })), q(url)));
+		q('Content-Type: application/json'), q(sprintf('%J', payload)), q(url)));
 
 	return (r.code == 0) ? { ok: true } : { error: trim(r.out) || sprintf('Slack request failed (%d)', r.code) };
 }
 
-function slack_format(msg) {
-	let parts = msg.complete ? '' : sprintf(' (incomplete: %d of %d parts)', msg.parts, msg.total);
+function slack_message(cfg, msg) {
+	let label = slack_label(cfg);
+	let body = msg.text ?? '';
+	let when = local_time(msg.timestamp);
+	let context = [
+		{ type: 'mrkdwn', text: CLOCK_EMOJI + ' ' + when },
+		{ type: 'mrkdwn', text: slack_escape(label) }
+	];
 
-	return sprintf('*SMS from %s* on %s, %s UTC%s\n%s',
-		slack_escape(msg.sender), slack_escape(hostname()), msg.timestamp, parts,
-		slack_escape(msg.text));
+	if (!msg.complete)
+		push(context, { type: 'mrkdwn', text: sprintf('incomplete: %d of %d parts', msg.parts, msg.total) });
+
+	return {
+		text: truncate(sprintf('%s SMS from %s - %s: %s', SMS_EMOJI, slack_escape(msg.sender),
+			slack_escape(label), slack_escape(body)), SECTION_MAX, true),
+		blocks: [
+			{ type: 'section', text: { type: 'mrkdwn',
+				text: SMS_EMOJI + ' *' + truncate(slack_escape(msg.sender), SENDER_MAX, false) + '*' } },
+			// plain_text is never parsed by Slack, so the body is sent unescaped.
+			{ type: 'section', text: { type: 'plain_text', text: truncate(body, SECTION_MAX, true) || ' ' } },
+			{ type: 'context', elements: context }
+		]
+	};
 }
 
 // Stable identity of a message for the forwarded-state file (FNV-1a).
@@ -842,13 +920,25 @@ function sms_forward(cfg, indexes) {
 	for (let m in l.messages)
 		for (let i in m.indexes)
 			if (i in idx)
-				return slack_post(cfg, slack_format(m));
+				return slack_post(cfg, slack_message(cfg, m));
 
 	return { error: 'Message not found' };
 }
 
 function slack_test(cfg) {
-	return slack_post(cfg, sprintf('Test message from modem-lite on %s', slack_escape(hostname())));
+	let label = slack_escape(slack_label(cfg));
+
+	return slack_post(cfg, {
+		text: sprintf('%s modem-lite test message - %s', SMS_EMOJI, label),
+		blocks: [
+			{ type: 'section', text: { type: 'mrkdwn', text: SMS_EMOJI + ' *modem-lite test message*' } },
+			{ type: 'section', text: { type: 'plain_text', text: 'SMS forwarding to this channel works.' } },
+			{ type: 'context', elements: [
+				{ type: 'mrkdwn', text: CLOCK_EMOJI + ' ' + local_time(fmt_utc(time())) },
+				{ type: 'mrkdwn', text: label }
+			] }
+		]
+	});
 }
 
 // Forward messages not forwarded before. When forwarding is (re-)enabled the
@@ -893,7 +983,7 @@ function forward_new(cfg) {
 		if (!m.complete && time() - (utc_epoch(m.timestamp) ?? 0) < INCOMPLETE_GRACE)
 			continue;
 
-		let r = slack_post(cfg, slack_format(m));
+		let r = slack_post(cfg, slack_message(cfg, m));
 
 		if (r.error) {
 			log('Slack forwarding failed: ' + r.error);
@@ -931,6 +1021,6 @@ return {
 	sms_list, sms_send, sms_delete, sms_forward, slack_test, forward_new,
 	// exported for tests
 	parse_cgdcont, data_cid, parse_link, parse_signal, signal_level,
-	parse_cops, parse_reg, merge_parts, utc_epoch, slack_format, msg_key,
-	pdu_tz, to_utc
+	parse_cops, parse_reg, merge_parts, utc_epoch, slack_message, slack_escape,
+	truncate, local_time, msg_key, pdu_tz, to_utc
 };
